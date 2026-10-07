@@ -1,278 +1,703 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <termios.h>
+#include <signal.h>
+#include <sys/wait.h>
 
-#define MAX_HISTORY 20
-#define MAX_COMMAND 100
+#include "msgbus.h"
 
-char history[MAX_HISTORY][MAX_COMMAND];
-int history_count = 0;
+#define LOG_FILE "msgbus.log"
 
-void show_help() {
-    printf("\n===== MsgBus Commands =====\n");
-    printf("  start       - Show broker start command\n");
-    printf("  publisher   - Show publisher command\n");
-    printf("  subscriber  - Show subscriber command\n");
-    printf("  log         - Show log file command\n");
-    printf("  status      - Show current process ID\n");
-    printf("  help        - Show commands\n");
-    printf("  exit        - Exit interface\n");
+pid_t broker_pid = -1;
+
+pid_t subscriber_pids[MAX_SUBSCRIBERS];
+int subscriber_count = 0;
+
+
+/* Check and remove finished subscribers */
+void update_subscribers() {
+
+    for (int i = 0; i < subscriber_count; i++) {
+
+        if (subscriber_pids[i] > 0) {
+
+            int status;
+
+            if (waitpid(
+                    subscriber_pids[i],
+                    &status,
+                    WNOHANG
+                ) > 0) {
+
+                subscriber_pids[i] = -1;
+            }
+        }
+    }
 }
 
-void add_history(char *command) {
 
-    if (strlen(command) == 0)
+/* Start Broker */
+void start_broker() {
+
+    if (broker_pid > 0) {
+        printf("\n[MsgBus] Broker is already running.\n");
         return;
-
-    if (history_count < MAX_HISTORY) {
-
-        strcpy(history[history_count], command);
-        history_count++;
-
-    } else {
-
-        for (int i = 0; i < MAX_HISTORY - 1; i++) {
-            strcpy(history[i], history[i + 1]);
-        }
-
-        strcpy(history[MAX_HISTORY - 1], command);
     }
+
+    broker_pid = fork();
+
+    if (broker_pid < 0) {
+        perror("fork");
+        return;
+    }
+
+    if (broker_pid == 0) {
+
+        execl(
+            "./broker",
+            "./broker",
+            NULL
+        );
+
+        perror("exec");
+        exit(1);
+    }
+
+    sleep(1);
+
+    printf("\n[MsgBus] Broker started successfully.\n");
+    printf("[MsgBus] Broker PID: %d\n", broker_pid);
 }
 
-void clear_line(char *command) {
 
-    printf("\33[2K\r");
-    printf("msgbus> %s", command);
+/* Publish Message */
+void publish_message() {
 
-    fflush(stdout);
-}
+    char topic[TOPIC_SIZE];
+    char message[MESSAGE_SIZE];
 
-void read_command(char *command) {
+    if (broker_pid <= 0) {
+        printf("\n[Error] Start MsgBus first.\n");
+        return;
+    }
 
-    struct termios old_terminal;
-    struct termios new_terminal;
+    printf("\n===== Publish Message =====\n");
 
-    tcgetattr(STDIN_FILENO, &old_terminal);
+    printf("Enter topic: ");
+    fgets(topic, sizeof(topic), stdin);
+    topic[strcspn(topic, "\n")] = '\0';
 
-    new_terminal = old_terminal;
+    printf("Enter message: ");
+    fgets(message, sizeof(message), stdin);
+    message[strcspn(message, "\n")] = '\0';
 
-    new_terminal.c_lflag &= ~(ICANON | ECHO);
 
-    tcsetattr(
-        STDIN_FILENO,
-        TCSANOW,
-        &new_terminal
+    int pipe_fd[2];
+
+    if (pipe(pipe_fd) == -1) {
+        perror("pipe");
+        return;
+    }
+
+
+    pid_t publisher_pid = fork();
+
+    if (publisher_pid < 0) {
+
+        perror("fork");
+
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+
+        return;
+    }
+
+
+    if (publisher_pid == 0) {
+
+        close(pipe_fd[1]);
+
+        dup2(
+            pipe_fd[0],
+            STDIN_FILENO
+        );
+
+        close(pipe_fd[0]);
+
+        execl(
+            "./publisher",
+            "./publisher",
+            NULL
+        );
+
+        perror("exec");
+        exit(1);
+    }
+
+
+    close(pipe_fd[0]);
+
+    dprintf(
+        pipe_fd[1],
+        "%s\n%s\n",
+        topic,
+        message
     );
 
-    int position = 0;
-    int history_position = history_count;
+    close(pipe_fd[1]);
 
-    command[0] = '\0';
+    waitpid(
+        publisher_pid,
+        NULL,
+        0
+    );
 
-    printf("msgbus> ");
-    fflush(stdout);
-
-    while (1) {
-
-        char c;
-
-        if (read(STDIN_FILENO, &c, 1) != 1)
-            continue;
-
-        /* Enter key */
-        if (c == '\n' || c == '\r') {
-
-            command[position] = '\0';
-
-            printf("\n");
-
-            break;
-        }
-
-        /* Backspace */
-        if (c == 127 || c == 8) {
-
-            if (position > 0) {
-
-                position--;
-
-                command[position] = '\0';
-
-                printf("\b \b");
-
-                fflush(stdout);
-            }
-
-            continue;
-        }
-
-        /* Arrow keys */
-        if (c == 27) {
-
-            char sequence[2];
-
-            if (read(STDIN_FILENO, &sequence[0], 1) != 1)
-                continue;
-
-            if (read(STDIN_FILENO, &sequence[1], 1) != 1)
-                continue;
-
-            /* Up arrow */
-            if (sequence[0] == '[' &&
-                sequence[1] == 'A') {
-
-                if (history_count > 0 &&
-                    history_position > 0) {
-
-                    history_position--;
-
-                    strcpy(
-                        command,
-                        history[history_position]
-                    );
-
-                    position = strlen(command);
-
-                    clear_line(command);
-                }
-            }
-
-            /* Down arrow */
-            else if (sequence[0] == '[' &&
-                     sequence[1] == 'B') {
-
-                if (history_position < history_count - 1) {
-
-                    history_position++;
-
-                    strcpy(
-                        command,
-                        history[history_position]
-                    );
-
-                    position = strlen(command);
-
-                    clear_line(command);
-                }
-                else if (history_position ==
-                         history_count - 1) {
-
-                    history_position = history_count;
-
-                    command[0] = '\0';
-
-                    position = 0;
-
-                    clear_line(command);
-                }
-            }
-
-            continue;
-        }
-
-        /* Normal character */
-        if (c >= 32 && c <= 126) {
-
-            if (position < MAX_COMMAND - 1) {
-
-                command[position] = c;
-
-                position++;
-
-                command[position] = '\0';
-
-                printf("%c", c);
-
-                fflush(stdout);
-            }
-        }
-    }
-
-    tcsetattr(
-        STDIN_FILENO,
-        TCSANOW,
-        &old_terminal
+    printf(
+        "[MsgBus] Message published successfully.\n"
     );
 }
 
+
+/* Subscribe to Topic */
+void subscribe_topic() {
+
+    char topic[TOPIC_SIZE];
+
+    if (broker_pid <= 0) {
+        printf("\n[Error] Start MsgBus first.\n");
+        return;
+    }
+
+    update_subscribers();
+
+
+    if (subscriber_count >= MAX_SUBSCRIBERS) {
+
+        printf(
+            "\n[Error] Maximum subscribers reached (%d).\n",
+            MAX_SUBSCRIBERS
+        );
+
+        return;
+    }
+
+
+    printf("\n===== Subscribe to Topic =====\n");
+
+    printf("Enter topic: ");
+
+    fgets(
+        topic,
+        sizeof(topic),
+        stdin
+    );
+
+    topic[strcspn(topic, "\n")] = '\0';
+
+
+    int pipe_fd[2];
+
+    if (pipe(pipe_fd) == -1) {
+        perror("pipe");
+        return;
+    }
+
+
+    pid_t subscriber_pid = fork();
+
+    if (subscriber_pid < 0) {
+
+        perror("fork");
+
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+
+        return;
+    }
+
+
+    if (subscriber_pid == 0) {
+
+        close(pipe_fd[1]);
+
+        dup2(
+            pipe_fd[0],
+            STDIN_FILENO
+        );
+
+        close(pipe_fd[0]);
+
+        execl(
+            "./subscriber",
+            "./subscriber",
+            NULL
+        );
+
+        perror("exec");
+        exit(1);
+    }
+
+
+    close(pipe_fd[0]);
+
+
+    dprintf(
+        pipe_fd[1],
+        "%s\n",
+        topic
+    );
+
+    close(pipe_fd[1]);
+
+
+    subscriber_pids[subscriber_count] =
+        subscriber_pid;
+
+    subscriber_count++;
+
+
+    printf(
+        "\n[MsgBus] Subscriber started.\n"
+    );
+
+    printf(
+        "[MsgBus] Subscriber PID: %d\n",
+        subscriber_pid
+    );
+
+    printf(
+        "[MsgBus] Subscribed to topic: %s\n",
+        topic
+    );
+
+    printf(
+        "[MsgBus] Active subscribers: %d/%d\n",
+        subscriber_count,
+        MAX_SUBSCRIBERS
+    );
+}
+
+
+/* Show Status */
+void show_status() {
+
+    update_subscribers();
+
+    printf("\n");
+
+    printf(
+        "+--------------------------------------+\n"
+    );
+
+    printf(
+        "|            MSGBUS STATUS             |\n"
+    );
+
+    printf(
+        "+--------------------------------------+\n"
+    );
+
+
+    if (broker_pid > 0)
+
+        printf(
+            "| Broker      : RUNNING  PID %-8d |\n",
+            broker_pid
+        );
+
+    else
+
+        printf(
+            "| Broker      : STOPPED               |\n"
+        );
+
+
+    int active = 0;
+
+    for (int i = 0; i < subscriber_count; i++) {
+
+        if (subscriber_pids[i] > 0) {
+
+            printf(
+                "| Subscriber %d: RUNNING  PID %-8d |\n",
+                i + 1,
+                subscriber_pids[i]
+            );
+
+            active++;
+        }
+    }
+
+
+    if (active == 0) {
+
+        printf(
+            "| Subscribers : NONE                   |\n"
+        );
+    }
+
+
+    printf(
+        "| Active      : %d/%d subscribers       |\n",
+        active,
+        MAX_SUBSCRIBERS
+    );
+
+
+    printf(
+        "+--------------------------------------+\n"
+    );
+}
+
+
+/* View Log */
+void view_log() {
+
+    FILE *file = fopen(
+        LOG_FILE,
+        "r"
+    );
+
+    if (file == NULL) {
+
+        printf(
+            "\n[MsgBus] No messages logged yet.\n"
+        );
+
+        return;
+    }
+
+
+    char line[500];
+
+    printf("\n");
+
+    printf(
+        "+--------------------------------------+\n"
+    );
+
+    printf(
+        "|             MESSAGE LOG              |\n"
+    );
+
+    printf(
+        "+--------------------------------------+\n"
+    );
+
+
+    while (
+        fgets(
+            line,
+            sizeof(line),
+            file
+        )
+    ) {
+
+        printf(
+            "%s",
+            line
+        );
+    }
+
+
+    printf(
+        "+--------------------------------------+\n"
+    );
+
+
+    fclose(file);
+}
+
+
+/* Stop All Subscribers */
+void stop_subscribers() {
+
+    update_subscribers();
+
+    for (int i = 0; i < subscriber_count; i++) {
+
+        if (subscriber_pids[i] > 0) {
+
+            kill(
+                subscriber_pids[i],
+                SIGINT
+            );
+
+            waitpid(
+                subscriber_pids[i],
+                NULL,
+                0
+            );
+
+            printf(
+                "[MsgBus] Subscriber %d stopped.\n",
+                i + 1
+            );
+
+            subscriber_pids[i] = -1;
+        }
+    }
+
+    subscriber_count = 0;
+}
+
+
+/* Stop Broker */
+void stop_broker() {
+
+    if (broker_pid > 0) {
+
+        kill(
+            broker_pid,
+            SIGINT
+        );
+
+        waitpid(
+            broker_pid,
+            NULL,
+            0
+        );
+
+        printf(
+            "[MsgBus] Broker stopped.\n"
+        );
+
+        broker_pid = -1;
+    }
+}
+
+
+/* Stop MsgBus */
+void stop_msgbus() {
+
+    printf(
+        "\n[MsgBus] Stopping MsgBus...\n"
+    );
+
+    stop_subscribers();
+
+    stop_broker();
+
+    printf(
+        "[MsgBus] All processes stopped.\n"
+    );
+}
+
+
+/* Display Menu */
+void show_menu() {
+
+    printf("\n");
+
+    printf(
+        "+----------------------------------------+\n"
+    );
+
+    printf(
+        "|              MSGBUS SYSTEM             |\n"
+    );
+
+    printf(
+        "|        Shared-Memory Message Bus       |\n"
+    );
+
+    printf(
+        "+----------------------------------------+\n"
+    );
+
+    printf(
+        "|                                        |\n"
+    );
+
+    printf(
+        "|   [1]  >  Start Message Bus            |\n"
+    );
+
+    printf(
+        "|   [2]  >  Publish Message              |\n"
+    );
+
+    printf(
+        "|   [3]  >  Subscribe to Topic           |\n"
+    );
+
+    printf(
+        "|   [4]  >  System Status                |\n"
+    );
+
+    printf(
+        "|   [5]  >  View Message Log             |\n"
+    );
+
+    printf(
+        "|   [6]  >  Stop Message Bus             |\n"
+    );
+
+    printf(
+        "|   [7]  >  Exit                         |\n"
+    );
+
+    printf(
+        "|                                        |\n"
+    );
+
+    printf(
+        "+----------------------------------------+\n"
+    );
+}
+
+
+/* Main */
 int main() {
 
-    char command[MAX_COMMAND];
+    int choice;
 
-    printf("====================================\n");
-    printf("          MsgBus Interface           \n");
-    printf("====================================\n");
 
-    printf("MsgBus Interface PID: %d\n", getpid());
+    for (int i = 0; i < MAX_SUBSCRIBERS; i++) {
 
-    printf("Type 'help' to see commands.\n");
-    printf("Use UP/DOWN arrows for command history.\n\n");
+        subscriber_pids[i] = -1;
+    }
+
+
+    printf("\n");
+
+    printf(
+        "+----------------------------------------+\n"
+    );
+
+    printf(
+        "|                                        |\n"
+    );
+
+    printf(
+        "|              MSGBUS                    |\n"
+    );
+
+    printf(
+        "|                                        |\n"
+    );
+
+    printf(
+        "|      Shared-Memory Message Bus         |\n"
+    );
+
+    printf(
+        "|                                        |\n"
+    );
+
+    printf(
+        "+----------------------------------------+\n"
+    );
+
+
+    printf(
+        "\nInterface PID: %d\n",
+        getpid()
+    );
+
 
     while (1) {
 
-        read_command(command);
+        show_menu();
 
-        if (strlen(command) == 0)
+        printf(
+            "\nEnter your choice [1-7]: "
+        );
+
+
+        if (
+            scanf(
+                "%d",
+                &choice
+            ) != 1
+        ) {
+
+            while (
+                getchar() != '\n'
+            );
+
+            printf(
+                "\n[Error] Enter a number from 1 to 7.\n"
+            );
+
             continue;
-
-        add_history(command);
-
-        if (strcmp(command, "help") == 0) {
-
-            show_help();
         }
 
-        else if (strcmp(command, "start") == 0) {
 
-            printf(
-                "Start broker using: ./broker\n"
-            );
-        }
+        while (
+            getchar() != '\n'
+        );
 
-        else if (strcmp(command, "publisher") == 0) {
 
-            printf(
-                "Start publisher using: ./publisher\n"
-            );
-        }
+        switch (choice) {
 
-        else if (strcmp(command, "subscriber") == 0) {
+            case 1:
 
-            printf(
-                "Start subscriber using: ./subscriber\n"
-            );
-        }
+                start_broker();
 
-        else if (strcmp(command, "log") == 0) {
+                break;
 
-            printf(
-                "View messages using: cat msgbus.log\n"
-            );
-        }
 
-        else if (strcmp(command, "status") == 0) {
+            case 2:
 
-            printf(
-                "Interface PID: %d\n",
-                getpid()
-            );
-        }
+                publish_message();
 
-        else if (strcmp(command, "exit") == 0) {
+                break;
 
-            printf("MsgBus interface stopped.\n");
 
-            break;
-        }
+            case 3:
 
-        else {
+                subscribe_topic();
 
-            printf(
-                "Unknown command. Type 'help'.\n"
-            );
+                break;
+
+
+            case 4:
+
+                show_status();
+
+                break;
+
+
+            case 5:
+
+                view_log();
+
+                break;
+
+
+            case 6:
+
+                stop_msgbus();
+
+                break;
+
+
+            case 7:
+
+                printf(
+                    "\n[MsgBus] Exiting...\n"
+                );
+
+                stop_msgbus();
+
+                printf(
+                    "[MsgBus] Interface stopped.\n"
+                );
+
+                return 0;
+
+
+            default:
+
+                printf(
+                    "\n[Error] Invalid choice. "
+                    "Please select 1-7.\n"
+                );
         }
     }
+
 
     return 0;
 }

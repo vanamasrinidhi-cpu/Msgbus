@@ -8,7 +8,7 @@
 #include <string.h>
 
 #include "msgbus.h"
-
+#include "../ipc_signals/signal_manager.h"
 MessageBus *bus = NULL;
 int shm_fd = -1;
 
@@ -36,7 +36,9 @@ void cleanup(int sig) {
 
 int main() {
 
-    signal(SIGINT, cleanup);
+    if (register_signal(SIGINT, cleanup) == -1) {
+    return 1;
+}
 
     shm_unlink(SHM_NAME);
 
